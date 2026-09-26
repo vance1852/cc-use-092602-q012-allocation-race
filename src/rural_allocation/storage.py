@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS nominations (
         CHECK(state IN ('submitted','allocated','in_transit','delivered','cancelled')),
     revision INTEGER NOT NULL DEFAULT 1,
     idempotency_key TEXT NOT NULL UNIQUE,
+    allocation_id INTEGER REFERENCES allocation_runs(allocation_id),
     submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
     submitted_at TEXT NOT NULL
 );
@@ -128,11 +129,14 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     route_id TEXT NOT NULL REFERENCES routes(route_id),
     service_date TEXT NOT NULL,
     input_sha256 TEXT NOT NULL,
+    limits_sha256 TEXT NOT NULL,
+    commit_version INTEGER NOT NULL,
     available_capacity TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL,
-    UNIQUE(route_id, service_date, input_sha256)
+    UNIQUE(route_id, service_date)
 );
 
 CREATE TABLE IF NOT EXISTS transfers (
@@ -209,6 +213,60 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_allocation_schema(connection)
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_allocation_schema(connection: sqlite3.Connection) -> None:
+    """把旧版分配运行结构重建为绑定快照与提交版本的形态。
+
+    旧库缺少 snapshot_json / limits_sha256 / commit_version 列，且唯一约束是
+    (route_id, service_date, input_sha256)，允许同一地块池同一日期留下多套运行。
+    重建遵循 SQLite 官方改表流程：临时关闭外键、事务内重建并搬移数据。
+    历史运行没有可还原的快照，限制指纹置空，重放时会按领域冲突处理。
+    """
+    runs_outdated = "snapshot_json" not in _table_columns(connection, "allocation_runs")
+    nominations_outdated = "allocation_id" not in _table_columns(connection, "nominations")
+    if not runs_outdated and not nominations_outdated:
+        return
+    foreign_keys_was_on = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            if "snapshot_json" not in _table_columns(connection, "allocation_runs"):
+                connection.execute(
+                    "CREATE TABLE allocation_runs_migrated ("
+                    "allocation_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "route_id TEXT NOT NULL REFERENCES routes(route_id),"
+                    "service_date TEXT NOT NULL,"
+                    "input_sha256 TEXT NOT NULL,"
+                    "limits_sha256 TEXT NOT NULL,"
+                    "commit_version INTEGER NOT NULL,"
+                    "available_capacity TEXT NOT NULL,"
+                    "snapshot_json TEXT NOT NULL,"
+                    "result_json TEXT NOT NULL,"
+                    "created_by TEXT NOT NULL REFERENCES supply_users(user_id),"
+                    "created_at TEXT NOT NULL,"
+                    "UNIQUE(route_id, service_date))"
+                )
+                connection.execute(
+                    "INSERT INTO allocation_runs_migrated(allocation_id,route_id,service_date,input_sha256,"
+                    "limits_sha256,commit_version,available_capacity,snapshot_json,result_json,created_by,created_at) "
+                    "SELECT allocation_id,route_id,service_date,input_sha256,'',allocation_id,"
+                    "available_capacity,'{}',result_json,created_by,created_at FROM allocation_runs"
+                )
+                connection.execute("DROP TABLE allocation_runs")
+                connection.execute("ALTER TABLE allocation_runs_migrated RENAME TO allocation_runs")
+            if "allocation_id" not in _table_columns(connection, "nominations"):
+                connection.execute(
+                    "ALTER TABLE nominations ADD COLUMN allocation_id INTEGER "
+                    "REFERENCES allocation_runs(allocation_id)"
+                )
+    finally:
+        connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys_was_on else 'OFF'}")
 
 
 @contextmanager

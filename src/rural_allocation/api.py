@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .errors import SupplyError, ValidationFailed
 from .service import SupplyService
 from .storage import connect
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,8 +27,14 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
-        self.service = service
+    def __init__(self, service: SupplyService | Callable[[], SupplyService]) -> None:
+        # 直接传入服务实例，或传入工厂按调用线程解析（每个工作线程独立连接）。
+        self._service_source = service
+
+    @property
+    def service(self) -> SupplyService:
+        source = self._service_source
+        return source() if callable(source) else source
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -75,6 +86,8 @@ class JsonApplication:
                 return Response(201, self.service.submit_nomination(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
+            if method == "GET" and len(parts) == 4 and parts[0] == "routes" and parts[2] == "allocations":
+                return Response(200, self.service.allocation_audit(actor, parts[1], parts[3]))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
             if method == "POST" and path == "/scenarios":
@@ -90,6 +103,9 @@ class JsonApplication:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
+        except Exception:
+            logger.exception("接口处理出现未预期异常")
+            return Response(500, {"error": {"code": "internal_error", "message": "服务内部错误"}})
 
 
 def make_handler(application: JsonApplication):
@@ -125,15 +141,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
-    connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    local = threading.local()
+
+    def thread_service() -> SupplyService:
+        service = getattr(local, "service", None)
+        if service is None:
+            service = SupplyService(connect(args.database))
+            local.service = service
+        return service
+
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(thread_service)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
-        connection.close()
     return 0
 
 

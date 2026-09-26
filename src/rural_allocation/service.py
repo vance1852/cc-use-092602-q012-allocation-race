@@ -7,7 +7,7 @@ import json
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
@@ -39,9 +39,17 @@ ROLE_PERMISSIONS = {
 
 
 class SupplyService:
-    def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        clock=None,
+        *,
+        commit_probe: Callable[[str], None] | None = None,
+    ) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
+        # 测试探针：在事务提交前于事务内调用，用于确定性并发测试；生产环境保持 None。
+        self._commit_probe = commit_probe or (lambda label: None)
         initialize(connection)
 
     def _now(self) -> str:
@@ -341,68 +349,184 @@ class SupplyService:
                     (nomination.idempotency_key, request_digest, canonical_json(response), self._now()),
                 )
                 self._audit("nomination", nomination.nomination_id, "nomination.submitted", actor_id, raw)
+                self._commit_probe("nomination")
         except sqlite3.IntegrityError as exc:
             raise Conflict("提名编号或幂等键冲突") from exc
         return response
 
-    def _capacity_for_date(self, route: sqlite3.Row, service_date: str) -> Decimal:
+    def _capacity_snapshot(self, route: sqlite3.Row, service_date: str) -> tuple[Decimal, list[sqlite3.Row]]:
         start = service_date + "T00:00:00Z"
         end = service_date + "T23:59:59Z"
         rows = self.connection.execute(
-            "SELECT capacity_percent FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
+            "SELECT * FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
             "AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?) ORDER BY outage_id",
             (route["route_id"], end, start),
         ).fetchall()
         percentages = [Decimal(row["capacity_percent"]) for row in rows]
-        return effective_capacity(Decimal(route["daily_capacity"]), percentages)
+        return effective_capacity(Decimal(route["daily_capacity"]), percentages), rows
 
     def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
+        """集中分配：申请集合、容量快照、分配运行和状态更新在同一事务版本内提交。
+
+        整个用例在单个 BEGIN IMMEDIATE 事务中读取快照并写入结果，并发请求在写锁上
+        串行。相同输入的并发或重试返回已提交运行的同一业务结果；申请集合、限制版本
+        或既有运行不一致时抛出领域冲突；任何失败整体回滚，不留下半套申请状态。
+        """
         self._require(actor_id, "allocation.run")
-        route = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
-        if route is None:
-            raise NotFound("地块资源池不存在")
-        nominations = self.connection.execute(
-            "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
-            "ORDER BY priority,submitted_at,nomination_id",
-            (route_id, service_date),
-        ).fetchall()
-        if not nominations:
-            raise InvalidState("没有待分配提名")
-        requests = [
-            AllocationRequest(
-                row["nomination_id"],
-                Decimal(row["requested_mu"]),
-                int(row["priority"]),
-                row["submitted_at"],
-            )
-            for row in nominations
-        ]
-        available = self._capacity_for_date(route, service_date)
-        input_value = [dict(row) for row in nominations]
-        input_sha256 = digest({"route": dict(route), "nominations": input_value, "capacity": str(available)})
-        result_rows = allocate_capacity(available, requests)
-        result = {
-            "route_id": route_id,
-            "service_date": service_date,
-            "available_capacity": decimal_text(available),
-            "allocations": result_rows,
-        }
-        with transaction(self.connection, immediate=True):
-            cursor = self.connection.execute(
-                "INSERT INTO allocation_runs(route_id,service_date,input_sha256,available_capacity,result_json,"
-                "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (route_id, service_date, input_sha256, decimal_text(available), canonical_json(result), actor_id, self._now()),
-            )
-            for item in result_rows:
-                state = "allocated" if Decimal(item["allocated_mu"]) > 0 else "cancelled"
-                self.connection.execute(
-                    "UPDATE nominations SET allocated_mu=?,state=?,revision=revision+1 "
-                    "WHERE nomination_id=? AND state='submitted'",
-                    (item["allocated_mu"], state, item["nomination_id"]),
+        try:
+            with transaction(self.connection, immediate=True):
+                route = self.connection.execute(
+                    "SELECT * FROM routes WHERE route_id=?", (route_id,)
+                ).fetchone()
+                if route is None:
+                    raise NotFound("地块资源池不存在")
+                capacity, outages = self._capacity_snapshot(route, service_date)
+                limits = {
+                    "route": dict(route),
+                    "outages": [dict(row) for row in outages],
+                    "available_capacity": decimal_text(capacity),
+                }
+                limits_sha256 = digest(limits)
+                nominations = self.connection.execute(
+                    "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
+                    "ORDER BY priority,submitted_at,nomination_id",
+                    (route_id, service_date),
+                ).fetchall()
+                existing = self.connection.execute(
+                    "SELECT * FROM allocation_runs WHERE route_id=? AND service_date=?",
+                    (route_id, service_date),
+                ).fetchone()
+                if existing is not None:
+                    return self._replay_allocation(existing, nominations, limits_sha256)
+                if not nominations:
+                    raise InvalidState("没有待分配提名")
+                snapshot = {
+                    **limits,
+                    "service_date": service_date,
+                    "nominations": [dict(row) for row in nominations],
+                }
+                input_sha256 = digest(snapshot)
+                requests = [
+                    AllocationRequest(
+                        row["nomination_id"],
+                        Decimal(row["requested_mu"]),
+                        int(row["priority"]),
+                        row["submitted_at"],
+                    )
+                    for row in nominations
+                ]
+                result_rows = allocate_capacity(capacity, requests)
+                result = {
+                    "route_id": route_id,
+                    "service_date": service_date,
+                    "available_capacity": decimal_text(capacity),
+                    "allocations": result_rows,
+                }
+                commit_version = self.connection.execute(
+                    "SELECT COALESCE(MAX(commit_version), 0) + 1 AS next_version FROM allocation_runs"
+                ).fetchone()["next_version"]
+                cursor = self.connection.execute(
+                    "INSERT INTO allocation_runs(route_id,service_date,input_sha256,limits_sha256,commit_version,"
+                    "available_capacity,snapshot_json,result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        route_id,
+                        service_date,
+                        input_sha256,
+                        limits_sha256,
+                        commit_version,
+                        decimal_text(capacity),
+                        canonical_json(snapshot),
+                        canonical_json(result),
+                        actor_id,
+                        self._now(),
+                    ),
                 )
-            allocation_id = int(cursor.lastrowid)
-            self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
-        return {"allocation_id": allocation_id, **result}
+                allocation_id = int(cursor.lastrowid)
+                for item in result_rows:
+                    state = "allocated" if Decimal(item["allocated_mu"]) > 0 else "cancelled"
+                    updated = self.connection.execute(
+                        "UPDATE nominations SET allocated_mu=?,state=?,allocation_id=?,revision=revision+1 "
+                        "WHERE nomination_id=? AND state='submitted'",
+                        (item["allocated_mu"], state, allocation_id, item["nomination_id"]),
+                    )
+                    if updated.rowcount != 1:
+                        raise Conflict("申请状态在分配期间被修改")
+                self._audit(
+                    "route",
+                    route_id,
+                    "allocation.completed",
+                    actor_id,
+                    {"allocation_id": allocation_id, "commit_version": commit_version, "input_sha256": input_sha256},
+                )
+                self._commit_probe("allocate")
+                return {
+                    "allocation_id": allocation_id,
+                    **result,
+                    "commit_version": commit_version,
+                    "replayed": False,
+                }
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("集中分配与既有运行冲突") from exc
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" in message or "busy" in message:
+                raise Conflict("集中分配遇到并发写入冲突，请稍后重试") from exc
+            raise
+
+    def _replay_allocation(
+        self,
+        existing: sqlite3.Row,
+        pending: list[sqlite3.Row],
+        limits_sha256: str,
+    ) -> dict[str, Any]:
+        """校验既有运行与当前状态一致后重放同一业务结果，否则抛出领域冲突。"""
+        if pending:
+            raise Conflict("集中分配已提交，存在未纳入运行的申请")
+        if existing["limits_sha256"] != limits_sha256:
+            raise Conflict("集中分配已提交，地块池容量限制版本不一致")
+        result = json.loads(existing["result_json"])
+        expected = {item["nomination_id"]: item["allocated_mu"] for item in result["allocations"]}
+        bound = self.connection.execute(
+            "SELECT nomination_id,allocated_mu FROM nominations WHERE allocation_id=?",
+            (existing["allocation_id"],),
+        ).fetchall()
+        if {row["nomination_id"]: row["allocated_mu"] for row in bound} != expected:
+            raise Conflict("既有分配运行与申请状态不一致")
+        return {
+            "allocation_id": existing["allocation_id"],
+            **result,
+            "commit_version": existing["commit_version"],
+            "replayed": True,
+        }
+
+    def allocation_audit(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
+        """还原分配运行使用的快照、提交版本以及绑定到该运行的申请状态。"""
+        self._require(actor_id, "audit.read")
+        row = self.connection.execute(
+            "SELECT * FROM allocation_runs WHERE route_id=? AND service_date=?",
+            (route_id, service_date),
+        ).fetchone()
+        if row is None:
+            raise NotFound("分配运行不存在")
+        bound = self.connection.execute(
+            "SELECT nomination_id,state,allocated_mu,revision FROM nominations "
+            "WHERE allocation_id=? ORDER BY nomination_id",
+            (row["allocation_id"],),
+        ).fetchall()
+        return {
+            "allocation_id": row["allocation_id"],
+            "route_id": row["route_id"],
+            "service_date": row["service_date"],
+            "commit_version": row["commit_version"],
+            "input_sha256": row["input_sha256"],
+            "limits_sha256": row["limits_sha256"],
+            "available_capacity": row["available_capacity"],
+            "snapshot": json.loads(row["snapshot_json"]),
+            "result": json.loads(row["result_json"]),
+            "nominations": [dict(item) for item in bound],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
 
     def dispatch_transfer(
         self,

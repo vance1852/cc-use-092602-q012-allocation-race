@@ -26,11 +26,13 @@ def run(workspace: Path) -> dict[str, object]:
     service.add_inventory_lot("dispatch", {"lot_id": "lot-001", "facility_id": "village-a", "product": "cultivated-land", "grade": "PEAK_VALLEY", "quantity_mu": "150000", "unit_cost_cny": "91.25", "received_at": "2026-09-24T06:00:00Z"})
     service.submit_nomination("dispatch", {"nomination_id": "nom-001", "route_id": "pool-a-b", "shipper_id": "household-east", "service_date": "2026-09-25", "requested_mu": "80000", "priority": 10, "idempotency_key": "nom-key-001"})
     allocation = service.allocate("dispatch", "pool-a-b", "2026-09-25")
+    replayed = service.allocate("dispatch", "pool-a-b", "2026-09-25")
+    audit = service.allocation_audit("audit", "pool-a-b", "2026-09-25")
     transfer = service.dispatch_transfer("dispatch", "transfer-001", "nom-001", "lot-001", 2)
     service.create_scenario("plan", {"scenario_id": "relocation-recovery", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"pool-a-b": "20"}, "demand_changes": {"village-a:cultivated-land": "-5"}})
     service.approve_scenario("risk", "relocation-recovery", 1)
     scenario = service.run_scenario("plan", "relocation-recovery", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "allocation_replayed": replayed["replayed"] and replayed["allocation_id"] == allocation["allocation_id"], "commit_version": audit["commit_version"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

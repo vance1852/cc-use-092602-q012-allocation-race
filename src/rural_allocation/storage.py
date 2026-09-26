@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS routes (
     transit_hours INTEGER NOT NULL,
     revision INTEGER NOT NULL DEFAULT 1,
     state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended','retired')),
+    schedule_version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     CHECK(origin_id <> destination_id)
 );
@@ -74,6 +75,25 @@ CREATE TABLE IF NOT EXISTS route_outages (
 
 CREATE INDEX IF NOT EXISTS idx_outages_route_time
 ON route_outages(route_id, starts_at, ends_at);
+
+-- 容量限制（停运）集合的任何增改删都推进地块池的限制版本，分配据此识别陈旧快照。
+CREATE TRIGGER IF NOT EXISTS trg_outages_bump_version_insert
+AFTER INSERT ON route_outages
+BEGIN
+    UPDATE routes SET schedule_version = schedule_version + 1 WHERE route_id = NEW.route_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_outages_bump_version_update
+AFTER UPDATE ON route_outages
+BEGIN
+    UPDATE routes SET schedule_version = schedule_version + 1 WHERE route_id = NEW.route_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_outages_bump_version_delete
+AFTER DELETE ON route_outages
+BEGIN
+    UPDATE routes SET schedule_version = schedule_version + 1 WHERE route_id = OLD.route_id;
+END;
 
 CREATE TABLE IF NOT EXISTS inventory_lots (
     lot_id TEXT PRIMARY KEY,
@@ -115,6 +135,7 @@ CREATE TABLE IF NOT EXISTS nominations (
     state TEXT NOT NULL DEFAULT 'submitted'
         CHECK(state IN ('submitted','allocated','in_transit','delivered','cancelled')),
     revision INTEGER NOT NULL DEFAULT 1,
+    allocation_id INTEGER REFERENCES allocation_runs(allocation_id) DEFERRABLE INITIALLY DEFERRED,
     idempotency_key TEXT NOT NULL UNIQUE,
     submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
     submitted_at TEXT NOT NULL
@@ -127,12 +148,16 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     allocation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     route_id TEXT NOT NULL REFERENCES routes(route_id),
     service_date TEXT NOT NULL,
-    input_sha256 TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    limit_version INTEGER NOT NULL,
+    snapshot_sha256 TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
     available_capacity TEXT NOT NULL,
     result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL,
-    UNIQUE(route_id, service_date, input_sha256)
+    UNIQUE(route_id, service_date)
 );
 
 CREATE TABLE IF NOT EXISTS transfers (
